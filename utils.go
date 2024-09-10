@@ -5,10 +5,21 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
+	"sync"
 
 	"golang.org/x/net/html"
 )
+
+type config struct {
+	pages              map[string]int
+	baseURL            *url.URL
+	my                 *sync.Mutex
+	concurrencyControl chan struct{}
+	wg                 *sync.WaitGroup
+	maxPages           int
+}
 
 func normalizeURL(inputURL string) (string, error) {
 	parsedURL, err := url.Parse(inputURL)
@@ -37,7 +48,7 @@ func getURLsFromNode(node *html.Node) ([]string, error) {
 	return ret, nil
 }
 
-func getURLsFromHTML(htmlBody, rawBaseURL string) ([]string, error) {
+func (cfg *config) getURLsFromHTML(htmlBody string) ([]string, error) {
 	htmlReader := strings.NewReader(htmlBody)
 	rootNode, err := html.Parse(htmlReader)
 	if err != nil {
@@ -49,12 +60,12 @@ func getURLsFromHTML(htmlBody, rawBaseURL string) ([]string, error) {
 	}
 	i := 0
 	for i < len(rawUrls) {
-		if rawUrls[i] == "/" {
-			rawUrls = append(rawUrls[:i], rawUrls[i+1:]...)
+		parsedURL, err := url.Parse(rawUrls[i])
+		if err != nil {
+			return nil, err
 		}
-		if rawUrls[i][0] == '/' {
-			rawUrls[i] = rawBaseURL + rawUrls[i]
-		}
+		abs := cfg.baseURL.ResolveReference(parsedURL)
+		rawUrls[i] = abs.String()
 		i++
 	}
 	return rawUrls, nil
@@ -79,32 +90,77 @@ func getHTML(rawURL string) (string, error) {
 	return string(html), nil
 }
 
-func crawlPage(rawBaseURL, rawCurrentURL string, pages map[string]int) (map[string]int, error) {
-	if !strings.Contains(rawCurrentURL, rawBaseURL) {
-		return pages, nil
+func (cfg *config) addPageVisit(normalizedURL string) bool {
+	cfg.my.Lock()
+	defer cfg.my.Unlock()
+	if _, ok := cfg.pages[normalizedURL]; ok {
+		cfg.pages[normalizedURL]++
+		return false
+	} else {
+		cfg.pages[normalizedURL] = 1
+		return true
 	}
+}
+
+func (cfg *config) crawlPage(rawCurrentURL string) {
+	cfg.concurrencyControl <- struct{}{}
+	defer cfg.wg.Done()
+	if cfg.maxPages < len(cfg.pages) {
+		_ = <-cfg.concurrencyControl
+		return
+	}
+	if !strings.Contains(rawCurrentURL, cfg.baseURL.Hostname()) {
+		_ = <-cfg.concurrencyControl
+		return
+	}
+	// if rawURL is relative append it to the base url
 	normalizedCurrentURL, err := normalizeURL(rawCurrentURL)
 	if err != nil {
-		return nil, err
+		// fmt.Println("error normalizing url:", err)
+		_ = <-cfg.concurrencyControl
+		return
 	}
-	if _, ok := pages[normalizedCurrentURL]; ok {
-		pages[normalizedCurrentURL]++
-		return pages, nil
-	} else {
-		pages[normalizedCurrentURL] = 1
+	if !cfg.addPageVisit(normalizedCurrentURL) {
+		_ = <-cfg.concurrencyControl
+		return
 	}
-	html, err := getHTML(normalizedCurrentURL)
+	fmt.Println("crawling page:", rawCurrentURL)
+	html, err := getHTML(rawCurrentURL)
 	if err != nil {
-		return nil, err
+		// fmt.Println("error getting html for page:", rawCurrentURL, "error:", err)
+		_ = <-cfg.concurrencyControl
+		return
 	}
-	fmt.Println("Got html for page:", normalizedCurrentURL)
-	urls, err := getURLsFromHTML(html, normalizedCurrentURL)
+	urls, err := cfg.getURLsFromHTML(html)
 	if err != nil {
-		return nil, err
+		// fmt.Println("error getting urls from html:", err)
+		_ = <-cfg.concurrencyControl
+		return
 	}
-	fmt.Println("Got urls:", urls)
+	fmt.Println("Got urls: ", urls)
 	for _, url := range urls {
-		crawlPage(rawBaseURL, url, pages)
+		cfg.wg.Add(1)
+		go cfg.crawlPage(url)
 	}
-	return pages, nil
+	_ = <-cfg.concurrencyControl
+	return
+}
+
+type Page struct {
+	url   string
+	links int
+}
+
+func printReport(pages map[string]int, baseURL string) {
+	var pagesl []Page
+	for k, v := range pages {
+		pagesl = append(pagesl, Page{k, v})
+	}
+	sort.Slice(pagesl, func(i, j int) bool {
+		return pagesl[i].links < pagesl[j].links
+	})
+	fmt.Printf("=============================\nREPORT for %s\n=============================\n", baseURL)
+	for _, page := range pagesl {
+		fmt.Printf("Found %d internal links to %s\n", page.links, page.url)
+	}
 }
